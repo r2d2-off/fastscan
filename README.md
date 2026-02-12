@@ -38,6 +38,18 @@ Scan a subnet:
 ./fastscan -targets 192.168.1.0/24 -ports 1-1024 -workers 4096 -timeout 150ms -retries 0 -max-inflight-per-host 512 -stream-open
 ```
 
+Scan targets from a file:
+
+```bash
+cat > targets.txt <<'EOF'
+# one target per line
+192.168.1.1
+192.168.1.0/24  # CIDR is OK
+EOF
+
+./fastscan -targets-file targets.txt -ports 80-1000 -workers 4096 -timeout 150ms -retries 0 -max-inflight-per-host 512 -stream-open
+```
+
 Notes:
 - `timeout` strongly affects speed when ports are filtered/dropped (no RST).
 - `max-inflight-per-host` is a safety valve to avoid melting one host and to reduce false negatives.
@@ -47,7 +59,8 @@ Notes:
 
 All flags (run `./fastscan -h` for the authoritative list):
 
-- `-targets` (string, required): IP/CIDR/list, e.g. `192.168.1.10,10.0.0.0/24`
+- `-targets` (string): IP/CIDR/list, e.g. `192.168.1.10,10.0.0.0/24` (can be empty if `-targets-file` is set)
+- `-targets-file` (string, default empty): path to file with targets (one per line; supports `#` comments)
 - `-ports` (string, default `80,443`): ports list/ranges, e.g. `80,443,1-1024`
 - `-workers` (int, default `8192`): total concurrent workers (global parallelism)
 - `-timeout` (duration, default `300ms`): per-dial timeout; lower is faster on filtered ports but can miss slow networks

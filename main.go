@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -26,6 +27,7 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	targetsFlag := flag.String("targets", "", "IP/CIDR/list: 192.168.1.10,10.0.0.0/24")
+	targetsFileFlag := flag.String("targets-file", "", "path to file with targets (one per line; supports comments with #)")
 	portsFlag := flag.String("ports", "80,443", "ports: 80,443,1-1024")
 	workersFlag := flag.Int("workers", 8192, "concurrent workers")
 	perHostInflightFlag := flag.Int("max-inflight-per-host", 256, "max concurrent dials to one host (0 = unlimited)")
@@ -42,8 +44,8 @@ func main() {
 	showClosedFlag := flag.Bool("show-closed-errors", false, "print dial errors (very noisy)")
 	flag.Parse()
 
-	if *targetsFlag == "" {
-		exitf("use -targets with IP/CIDR/list, example: -targets 10.0.0.0/24 -ports 1-1024")
+	if *targetsFlag == "" && *targetsFileFlag == "" {
+		exitf("use -targets and/or -targets-file, example: -targets 10.0.0.0/24 -ports 1-1024")
 	}
 	if *workersFlag <= 0 {
 		exitf("workers must be > 0")
@@ -72,7 +74,11 @@ func main() {
 		exitf("no valid ports")
 	}
 
-	targets, err := expandTargets(*targetsFlag)
+	targetInputs, err := gatherTargetInputs(*targetsFlag, *targetsFileFlag)
+	if err != nil {
+		exitf("targets input error: %v", err)
+	}
+	targets, err := expandTargets(targetInputs)
 	if err != nil {
 		exitf("targets parse error: %v", err)
 	}
@@ -350,12 +356,82 @@ func parsePorts(raw string) ([]int, error) {
 	return ports, nil
 }
 
-func expandTargets(raw string) ([]string, error) {
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts)*64)
-	seen := make(map[string]struct{}, len(parts)*64)
+func gatherTargetInputs(targetsRaw, targetsFile string) ([]string, error) {
+	var out []string
 
+	addRaw := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		// Support -targets @path as a convenience shortcut.
+		if strings.HasPrefix(s, "@") && len(s) > 1 {
+			targetsFile = strings.TrimSpace(s[1:])
+			return
+		}
+		out = append(out, splitTargetsList(s)...)
+	}
+
+	addRaw(targetsRaw)
+
+	if targetsFile != "" {
+		lines, err := readTargetsFile(targetsFile)
+		if err != nil {
+			return nil, err
+		}
+		for _, ln := range lines {
+			out = append(out, splitTargetsList(ln)...)
+		}
+	}
+
+	return out, nil
+}
+
+func readTargetsFile(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Strip inline comments: "10.0.0.0/24  # office"
+		if idx := strings.IndexByte(line, '#'); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func splitTargetsList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
 	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func expandTargets(inputs []string) ([]string, error) {
+	out := make([]string, 0, len(inputs)*64)
+	seen := make(map[string]struct{}, len(inputs)*64)
+
+	for _, p := range inputs {
 		part := strings.TrimSpace(p)
 		if part == "" {
 			continue
