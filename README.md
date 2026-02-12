@@ -32,6 +32,18 @@ Scan a single host with a port range:
 ./fastscan -targets 192.168.1.1 -ports 80-1000 -workers 512 -timeout 150ms -retries 0 -max-inflight-per-host 512 -stream-open
 ```
 
+Scan an IPv4 range:
+
+```bash
+./fastscan -targets 100.64.0.0-100.127.255.255 -ports 9000 -workers 4096 -timeout 150ms -retries 0 -stream-open > open_9000.txt
+```
+
+The same range as CIDR:
+
+```bash
+./fastscan -targets 100.64.0.0/10 -ports 9000 -workers 4096 -timeout 150ms -retries 0 -stream-open > open_9000.txt
+```
+
 Scan a subnet:
 
 ```bash

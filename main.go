@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -78,17 +79,26 @@ func main() {
 	if err != nil {
 		exitf("targets input error: %v", err)
 	}
-	targets, err := expandTargets(targetInputs)
+	targets, err := parseTargets(targetInputs)
 	if err != nil {
 		exitf("targets parse error: %v", err)
 	}
-	if len(targets) == 0 {
+	targetCount := targets.Count()
+	if targetCount == 0 {
 		exitf("no targets after parsing")
 	}
 
-	totalTasks := uint64(len(targets) * len(ports))
+	totalTasks := targetCount * uint64(len(ports))
+
+	perHostInflight := *perHostInflightFlag
+	// Per-host limiter stores state per host. Disable it for very large target sets.
+	if perHostInflight > 0 && targetCount > 100_000 {
+		fmt.Fprintf(os.Stderr, "note: disabling -max-inflight-per-host for large target set (targets=%d)\n", targetCount)
+		perHostInflight = 0
+	}
+
 	fmt.Printf("targets=%d ports=%d total=%d workers=%d timeout=%s retries=%d per_host=%d\n",
-		len(targets), len(ports), totalTasks, *workersFlag, timeoutFlag.String(), *retriesFlag, *perHostInflightFlag)
+		targetCount, len(ports), totalTasks, *workersFlag, timeoutFlag.String(), *retriesFlag, perHostInflight)
 
 	start := time.Now()
 	ctx := context.Background()
@@ -119,7 +129,7 @@ func main() {
 		go func() {
 			defer workersWG.Done()
 			for job := range jobs {
-				hostLimiter := acquireHostToken(job.ip, *perHostInflightFlag, &hostLimiters)
+				hostLimiter := acquireHostToken(job.ip, perHostInflight, &hostLimiters)
 				addr := net.JoinHostPort(job.ip, strconv.Itoa(job.port))
 				conn, dialErr := dialWithRetries(ctx, dialer, addr, *timeoutFlag, *retriesFlag, *retryBackoffFlag)
 				if hostLimiter != nil {
@@ -254,9 +264,9 @@ func main() {
 
 	// Port-major order spreads load across hosts and reduces per-host burst loss.
 	for _, port := range ports {
-		for _, ip := range targets {
+		targets.ForEach(func(ip string) {
 			jobs <- targetPort{ip: ip, port: port}
-		}
+		})
 	}
 	close(jobs)
 
@@ -427,53 +437,173 @@ func splitTargetsList(s string) []string {
 	return out
 }
 
-func expandTargets(inputs []string) ([]string, error) {
-	out := make([]string, 0, len(inputs)*64)
-	seen := make(map[string]struct{}, len(inputs)*64)
+type ipv4Range struct {
+	start uint32
+	end   uint32
+}
 
-	for _, p := range inputs {
-		part := strings.TrimSpace(p)
+type Targets struct {
+	singles []string
+	ranges4 []ipv4Range
+}
+
+func (t Targets) Count() uint64 {
+	var n uint64
+	n += uint64(len(t.singles))
+	for _, r := range t.ranges4 {
+		if r.end >= r.start {
+			n += uint64(r.end-r.start) + 1
+		}
+	}
+	return n
+}
+
+func (t Targets) ForEach(fn func(ip string)) {
+	for _, s := range t.singles {
+		fn(s)
+	}
+	for _, r := range t.ranges4 {
+		for u := r.start; u <= r.end; u++ {
+			fn(ipv4ToString(u))
+			if u == ^uint32(0) {
+				break
+			}
+		}
+	}
+}
+
+func parseTargets(inputs []string) (Targets, error) {
+	seen := make(map[string]struct{}, len(inputs))
+	var out Targets
+
+	addSingle := func(ip string) {
+		if _, ok := seen[ip]; ok {
+			return
+		}
+		seen[ip] = struct{}{}
+		out.singles = append(out.singles, ip)
+	}
+
+	addRangeKey := func(key string, r ipv4Range) {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out.ranges4 = append(out.ranges4, r)
+	}
+
+	for _, raw := range inputs {
+		part := strings.TrimSpace(raw)
 		if part == "" {
 			continue
 		}
 
-		if ip := net.ParseIP(part); ip != nil {
-			ipStr := ip.String()
-			if _, ok := seen[ipStr]; ok {
-				continue
+		// IPv4 range: a-b (no CIDR slash)
+		if strings.Contains(part, "-") && !strings.Contains(part, "/") {
+			a, b, ok := splitRange(part)
+			if ok {
+				ra, okA := parseIPv4U32(a)
+				rb, okB := parseIPv4U32(b)
+				if okA && okB {
+					if ra > rb {
+						ra, rb = rb, ra
+					}
+					key := "range:" + ipv4ToString(ra) + "-" + ipv4ToString(rb)
+					addRangeKey(key, ipv4Range{start: ra, end: rb})
+					continue
+				}
 			}
-			seen[ipStr] = struct{}{}
-			out = append(out, ipStr)
+		}
+
+		if ip := net.ParseIP(part); ip != nil {
+			addSingle(ip.String())
 			continue
 		}
 
 		ip, ipNet, err := net.ParseCIDR(part)
 		if err != nil {
-			return nil, fmt.Errorf("bad target %q", part)
+			return Targets{}, fmt.Errorf("bad target %q", part)
 		}
 
-		startIP := ip.Mask(ipNet.Mask)
-		cur := cloneIP(startIP)
-		local := make([]string, 0, 64)
-		for ipNet.Contains(cur) {
-			local = append(local, cur.String())
-			incrementIP(cur)
+		start, end, ok := cidrToIPv4Range(ip, ipNet)
+		if ok {
+			key := "cidr:" + ipNet.String()
+			addRangeKey(key, ipv4Range{start: start, end: end})
+			continue
 		}
 
-		// Drop network and broadcast only for IPv4 subnets with host range (/30 and larger).
-		if isIPv4Mask(ipNet.Mask) && len(local) >= 4 {
-			local = local[1 : len(local)-1]
-		}
-		for _, ipStr := range local {
-			if _, ok := seen[ipStr]; ok {
-				continue
-			}
-			seen[ipStr] = struct{}{}
-			out = append(out, ipStr)
-		}
+		// IPv6 CIDRs are intentionally not expanded (too large). Treat as error to avoid surprises.
+		return Targets{}, fmt.Errorf("unsupported (non-IPv4) CIDR %q", part)
 	}
 
 	return out, nil
+}
+
+func splitRange(s string) (string, string, bool) {
+	ab := strings.SplitN(s, "-", 2)
+	if len(ab) != 2 {
+		return "", "", false
+	}
+	a := strings.TrimSpace(ab[0])
+	b := strings.TrimSpace(ab[1])
+	if a == "" || b == "" {
+		return "", "", false
+	}
+	return a, b, true
+}
+
+func parseIPv4U32(s string) (uint32, bool) {
+	ip := net.ParseIP(strings.TrimSpace(s))
+	if ip == nil {
+		return 0, false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(v4), true
+}
+
+func cidrToIPv4Range(ip net.IP, ipNet *net.IPNet) (uint32, uint32, bool) {
+	v4 := ip.To4()
+	if v4 == nil {
+		return 0, 0, false
+	}
+	mask := ipNet.Mask
+	if len(mask) != net.IPv4len {
+		return 0, 0, false
+	}
+
+	startIP := ip.Mask(mask).To4()
+	if startIP == nil {
+		return 0, 0, false
+	}
+	start := binary.BigEndian.Uint32(startIP)
+	m := binary.BigEndian.Uint32(mask)
+	end := start | ^m
+
+	// Drop network and broadcast only when there is a host range (>= 4 addresses).
+	if end-start+1 >= 4 {
+		start++
+		end--
+	}
+	return start, end, true
+}
+
+func ipv4ToString(u uint32) string {
+	b0 := byte(u >> 24)
+	b1 := byte(u >> 16)
+	b2 := byte(u >> 8)
+	b3 := byte(u)
+	buf := make([]byte, 0, 15)
+	buf = strconv.AppendInt(buf, int64(b0), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(b1), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(b2), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(b3), 10)
+	return string(buf)
 }
 
 func cloneIP(ip net.IP) net.IP {
