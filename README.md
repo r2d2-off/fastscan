@@ -4,6 +4,8 @@ Fast, dependency-free **TCP connect** port scanner. A single static binary — d
 
 `fastscan` opens an ordinary TCP connection (`connect()`) to each `ip:port` and reports the ones that accept. Because it uses the normal socket API instead of crafting raw SYN packets, it needs **no privileges** and runs anywhere a Go binary runs. It is **not** a masscan replacement for internet-wide raw-SYN sweeps — it trades peak packet rate for zero-privilege portability and simplicity.
 
+<img width="1698" height="396" alt="image" src="https://github.com/user-attachments/assets/b139f046-7d60-4157-b420-6e0fae88c27a" />
+
 ---
 
 ## What it does
