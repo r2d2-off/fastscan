@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -43,6 +45,10 @@ func main() {
 	progressStyleFlag := flag.String("progress-style", "auto", "auto|cr|line (cr uses \\r, line prints new lines)")
 	queueFlag := flag.Int("queue", 262144, "job queue size")
 	showClosedFlag := flag.Bool("show-closed-errors", false, "print dial errors (very noisy)")
+	daemonFlag := flag.Bool("daemon", false, "run detached in the background; the shell returns immediately")
+	outputFlag := flag.String("output", "", "write results to this file instead of stdout (default in -daemon: fastscan.out)")
+	logFlag := flag.String("log", "", "write progress/summary to this file instead of stderr (default in -daemon: <output>.log)")
+	pidFileFlag := flag.String("pid-file", "", "in -daemon mode, also write the background PID to this file")
 	flag.Parse()
 
 	if *targetsFlag == "" && *targetsFileFlag == "" {
@@ -86,6 +92,38 @@ func main() {
 	targetCount := targets.Count()
 	if targetCount == 0 {
 		exitf("no targets after parsing")
+	}
+
+	// Background mode: re-exec ourselves detached, then return the shell.
+	// The child is marked via env so it does not re-daemonize.
+	isDaemonChild := os.Getenv(daemonEnvVar) == "1"
+	if *daemonFlag && !isDaemonChild {
+		pid, outPath, logPath, err := launchDaemon(*outputFlag, *logFlag, *pidFileFlag)
+		if err != nil {
+			exitf("daemon launch failed: %v", err)
+		}
+		fmt.Printf("fastscan running in background:\n  pid:    %d\n  output: %s\n  log:    %s\n",
+			pid, outPath, logPath)
+		return
+	}
+
+	// Foreground redirection. The daemon child already inherited these files
+	// as stdout/stderr from the parent, so it must not reopen them.
+	if !isDaemonChild {
+		if *outputFlag != "" {
+			f, ferr := os.OpenFile(*outputFlag, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if ferr != nil {
+				exitf("cannot open -output %q: %v", *outputFlag, ferr)
+			}
+			os.Stdout = f
+		}
+		if *logFlag != "" {
+			f, ferr := os.OpenFile(*logFlag, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if ferr != nil {
+				exitf("cannot open -log %q: %v", *logFlag, ferr)
+			}
+			os.Stderr = f
+		}
 	}
 
 	totalTasks := targetCount * uint64(len(ports))
@@ -786,6 +824,74 @@ func tcpFastControl(network, _ string, raw syscall.RawConn) error {
 		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096)
 	})
 	return nil
+}
+
+const daemonEnvVar = "FASTSCAN_DAEMON"
+
+// launchDaemon re-executes fastscan as a detached background process: a new
+// session with no controlling terminal (Setsid), stdin from /dev/null, and
+// stdout/stderr redirected to files. The child inherits those files directly,
+// so it needs no extra flags. The parent returns immediately and the shell is
+// free; the child is reparented to init once the parent exits.
+func launchDaemon(outPath, logPath, pidPath string) (int, string, string, error) {
+	if outPath == "" {
+		outPath = "fastscan.out"
+	}
+	if logPath == "" {
+		logPath = outPath + ".log"
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, "", "", err
+	}
+
+	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("open output %q: %w", outPath, err)
+	}
+	defer out.Close()
+
+	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("open log %q: %w", logPath, err)
+	}
+	defer logf.Close()
+
+	devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer devnull.Close()
+
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), daemonEnvVar+"=1")
+	cmd.Stdin = devnull
+	cmd.Stdout = out
+	cmd.Stderr = logf
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		return 0, "", "", err
+	}
+	pid := cmd.Process.Pid
+
+	if pidPath != "" {
+		if err := os.WriteFile(pidPath, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cannot write -pid-file %q: %v\n", pidPath, err)
+		}
+	}
+
+	// Detach: do not wait on the child.
+	_ = cmd.Process.Release()
+
+	if abs, aerr := filepath.Abs(outPath); aerr == nil {
+		outPath = abs
+	}
+	if abs, aerr := filepath.Abs(logPath); aerr == nil {
+		logPath = abs
+	}
+	return pid, outPath, logPath, nil
 }
 
 func exitf(format string, args ...any) {
