@@ -247,7 +247,7 @@ func main() {
 					eta = (time.Duration(remain/curRate) * time.Second).Truncate(time.Second).String()
 				}
 
-				pct := float64(cur) / float64(maxU64(totalTasks, 1))
+				pct := float64(cur) / float64(max(totalTasks, 1))
 				bar := renderBar(pct, 24)
 				line := fmt.Sprintf("%s %6.2f%% %d/%d open=%d cur=%.0f/s avg=%.0f/s eta=%s",
 					bar, pct*100, cur, totalTasks, open, curRate, avgRate, eta)
@@ -606,25 +606,6 @@ func ipv4ToString(u uint32) string {
 	return string(buf)
 }
 
-func cloneIP(ip net.IP) net.IP {
-	dst := make(net.IP, len(ip))
-	copy(dst, ip)
-	return dst
-}
-
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			return
-		}
-	}
-}
-
-func isIPv4Mask(mask net.IPMask) bool {
-	return len(mask) == net.IPv4len
-}
-
 type progressStyle uint8
 
 const (
@@ -681,20 +662,6 @@ func renderBar(pct float64, width int) string {
 		filled = 0
 	}
 	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
-}
-
-func max(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func maxU64(a, b uint64) uint64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func acquireHostToken(host string, max int, m *sync.Map) chan struct{} {
